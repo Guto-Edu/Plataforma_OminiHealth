@@ -1,188 +1,225 @@
-// src/lib/ws-asr-adapter.ts
 'use client';
 
-/**
- * Shims de tipos para Web Speech API (Chrome/Edge/Safari), já que lib.dom não
- * define SpeechRecognitionEvent. Mantém tudo leve e compatível.
- */
 type SpeechRecognitionAlternative = { transcript: string; confidence: number };
-type SpeechRecognitionResult = { isFinal: boolean; length: number; 0?: SpeechRecognitionAlternative; item: (i: number) => SpeechRecognitionAlternative };
-type SpeechRecognitionResultList = { length: number; item: (i: number) => SpeechRecognitionResult; [index: number]: SpeechRecognitionResult };
-type SpeechRecognitionEventLike = Event & { results: SpeechRecognitionResultList; resultIndex: number };
+type SpeechRecognitionResult = {
+  isFinal: boolean;
+  length: number;
+  0?: SpeechRecognitionAlternative;
+  item: (i: number) => SpeechRecognitionAlternative;
+};
+type SpeechRecognitionResultList = {
+  length: number;
+  item: (i: number) => SpeechRecognitionResult;
+  [index: number]: SpeechRecognitionResult;
+};
+type SpeechRecognitionEventLike = Event & {
+  results: SpeechRecognitionResultList;
+  resultIndex: number;
+};
 
-// Interface mínima do reconhecimento (webkitSpeechRecognition / SpeechRecognition)
 interface ISpeechRecognition extends EventTarget {
   lang: string;
   continuous: boolean;
   interimResults: boolean;
-
   onresult: ((this: ISpeechRecognition, ev: SpeechRecognitionEventLike) => any) | null;
   onerror: ((this: ISpeechRecognition, ev: any) => any) | null;
   onend: ((this: ISpeechRecognition, ev: Event) => any) | null;
-
   start(): void;
   stop(): void;
   abort(): void;
 }
 
-// Construtores possíveis expostos pelo browser
 type SpeechRecognitionCtor = new () => ISpeechRecognition;
+export type Handler = (text: string) => void;
+
+const LANG = 'pt-BR';
+const CHUNK_MS = 25_000;
+const RESTART_PAUSE_MS = 350;
+const RECENT_FINALS_MAX = 10;
+
+let handler: Handler = () => {};
+let interimHandler: Handler = () => {};
+let accText = '';
+let interimText = '';
+let running = false;
+let recognition: ISpeechRecognition | null = null;
+let chunkTimer: number | null = null;
+let restartTimer: number | null = null;
+let stoppingSoft = false;
+let restartAttempts = 0;
+const recentFinals: string[] = [];
 
 function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
   const w = typeof window !== 'undefined' ? (window as any) : undefined;
   if (!w) return null;
-  return (w.SpeechRecognition || w.webkitSpeechRecognition) as SpeechRecognitionCtor || null;
+  return (w.SpeechRecognition || w.webkitSpeechRecognition || null) as SpeechRecognitionCtor | null;
 }
 
-// ===== API compatível com a antiga =====
-export type Handler = (text: string) => void;
-
-let handler: Handler = () => {};
-export function setTranscriptHandler(fn: Handler) { handler = fn || (() => {}); }
-
-let _accText = '';
-let _running = false;
-let _recognition: ISpeechRecognition | null = null;
-let _chunkTimer: number | null = null;
-let _restartPauseTimer: number | null = null;
-let _stoppingSoft = false;
-
-// Deduplicação simples de finais recentes p/ evitar repetições em reinícios
-const _recentFinals: string[] = [];
-const RECENT_FINALS_MAX = 10;
-
-// Configuráveis:
-const CHUNK_MS = 30_000;          // corte ~30s
-const RESTART_PAUSE_MS = 300;     // pausa curta entre cortes (200–1000ms)
-const LANG = 'pt-BR';
-
-// Exponha se quiser checar suporte no componente
 export const isSpeechSupported = () => !!getSpeechRecognitionCtor();
+export const getTranscriptText = () => accText;
+export const getInterimTranscriptText = () => interimText;
 
-export function getTranscriptText(): string { return _accText; }
-export function resetTranscriptText() { _accText = ''; _recentFinals.length = 0; }
-
-// Internos util
-function _appendFinal(text: string) {
-  const t = (text || '').trim();
-  if (!t) return;
-  const last = _recentFinals[_recentFinals.length - 1];
-  if (last && last === t) return; // evita duplicar o mesmo final
-
-  _recentFinals.push(t);
-  if (_recentFinals.length > RECENT_FINALS_MAX) _recentFinals.shift();
-
-  _accText = _accText ? (_accText + '\n' + t) : t;
-
-  // entrega o acumulado "cru" sem normalização
-  try { handler(_accText); } catch {}
+export function setTranscriptHandler(fn: Handler) {
+  handler = fn || (() => {});
 }
 
-function _clearChunkTimer() {
-  if (_chunkTimer) { window.clearTimeout(_chunkTimer); _chunkTimer = null; }
-}
-function _clearRestartPauseTimer() {
-  if (_restartPauseTimer) { window.clearTimeout(_restartPauseTimer); _restartPauseTimer = null; }
+export function setInterimTranscriptHandler(fn: Handler) {
+  interimHandler = fn || (() => {});
 }
 
-function _scheduleChunkCut() {
-  _clearChunkTimer();
-  // Força um "flush" de finais a cada ~30s
-  _chunkTimer = window.setTimeout(() => {
-    if (!_recognition) return;
-    _stoppingSoft = true;         // marca que o stop foi intencional
-    try { _recognition.stop(); } catch {}
-  }, CHUNK_MS - 200);             // pequeno headroom p/ o onend chegar antes de 30s exatos
+export function resetTranscriptText() {
+  accText = '';
+  interimText = '';
+  recentFinals.length = 0;
+  try {
+    handler('');
+    interimHandler('');
+  } catch {}
 }
 
-function _createRecognition(): ISpeechRecognition {
+function clearChunkTimer() {
+  if (chunkTimer) window.clearTimeout(chunkTimer);
+  chunkTimer = null;
+}
+
+function clearRestartTimer() {
+  if (restartTimer) window.clearTimeout(restartTimer);
+  restartTimer = null;
+}
+
+function appendFinal(text: string) {
+  const clean = text.trim();
+  if (!clean) return;
+
+  const last = recentFinals[recentFinals.length - 1];
+  if (last === clean) return;
+
+  recentFinals.push(clean);
+  if (recentFinals.length > RECENT_FINALS_MAX) recentFinals.shift();
+
+  accText = accText ? `${accText}\n${clean}` : clean;
+  try {
+    handler(accText);
+  } catch {}
+}
+
+function scheduleChunkCut() {
+  clearChunkTimer();
+  chunkTimer = window.setTimeout(() => {
+    if (!recognition || !running) return;
+    stoppingSoft = true;
+    try {
+      recognition.stop();
+    } catch {}
+  }, CHUNK_MS);
+}
+
+function createRecognition(): ISpeechRecognition {
   const Ctor = getSpeechRecognitionCtor();
-  if (!Ctor) throw new Error('SpeechRecognition não é suportado neste navegador.');
+  if (!Ctor) throw new Error('SpeechRecognition nao e suportado neste navegador.');
 
   const rec = new Ctor();
   rec.lang = LANG;
-  rec.continuous = true;          // mantém a sessão ativa enquanto possível
-  rec.interimResults = true;      // mostra parciais (não salvamos parciais)
+  rec.continuous = true;
+  rec.interimResults = true;
 
   rec.onresult = (ev: SpeechRecognitionEventLike) => {
-    // iteramos somente pelos finais e acrescentamos crú
+    let partial = '';
+
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
-      const r = ev.results.item(i);
-      if (r?.isFinal) {
-        const alt = (r[0] ?? r.item(0));
-        if (alt?.transcript != null) _appendFinal(String(alt.transcript));
-      }
+      const result = ev.results.item(i);
+      const alt = result?.[0] ?? result?.item(0);
+      const text = String(alt?.transcript || '').trim();
+      if (!text) continue;
+
+      if (result.isFinal) appendFinal(text);
+      else partial += partial ? ` ${text}` : text;
     }
+
+    interimText = partial.trim();
+    try {
+      interimHandler(interimText);
+    } catch {}
   };
 
   rec.onerror = (ev: any) => {
     const err = String(ev?.error || '');
-    // Casos esperados durante o ciclo:
-    if (err === 'aborted') return;     // stop() intencional
-    // Em "no-speech" e "network" tentamos reiniciar; outros mostramos no console
-    if (err === 'no-speech' || err === 'network' || err === 'audio-capture' || err === 'not-allowed' || err === 'service-not-allowed') {
-      // backoff leve será aplicado via onend
-    } else {
+    if (err === 'aborted') return;
+
+    if (err === 'not-allowed' || err === 'service-not-allowed') {
+      running = false;
+      clearChunkTimer();
+      clearRestartTimer();
+      console.warn('[ASR:nativo] permissao do microfone negada ou bloqueada.');
+      return;
+    }
+
+    if (err !== 'no-speech' && err !== 'network' && err !== 'audio-capture') {
       console.warn('[ASR:nativo] erro:', err, ev?.message || '');
     }
   };
 
   rec.onend = () => {
-    // Sempre que termina, se ainda estamos "rodando", reinicia após pequena pausa
-    if (!_running) return;
+    if (!running) return;
 
-    _clearChunkTimer();
-    _clearRestartPauseTimer();
+    clearChunkTimer();
+    clearRestartTimer();
 
-    _restartPauseTimer = window.setTimeout(() => {
+    const delay = Math.min(1500, (stoppingSoft ? RESTART_PAUSE_MS : 500) + restartAttempts * 200);
+    restartTimer = window.setTimeout(() => {
       try {
-        _recognition?.start();
-        _scheduleChunkCut();
-      } catch (e) {
-        // Em alguns casos o motor ainda não está pronto; tenta novamente
-        _restartPauseTimer = window.setTimeout(() => {
-          try { _recognition?.start(); _scheduleChunkCut(); } catch {}
-        }, 500);
+        recognition?.start();
+        restartAttempts = 0;
+        scheduleChunkCut();
+      } catch {
+        restartAttempts += 1;
+        restartTimer = window.setTimeout(() => {
+          try {
+            recognition?.start();
+            restartAttempts = 0;
+            scheduleChunkCut();
+          } catch {}
+        }, 600);
       }
-    }, _stoppingSoft ? RESTART_PAUSE_MS : 500);
+    }, delay);
 
-    _stoppingSoft = false;
+    stoppingSoft = false;
   };
 
   return rec;
 }
 
-// ===== API =====
 export async function startASRWS(_serverUrl?: string, _stream?: MediaStream) {
-  if (_running) return;
-  _running = true;
-  resetTranscriptText();
-
+  if (running) return;
   if (!isSpeechSupported()) {
-    _running = false;
-    throw new Error('Este navegador não suporta SpeechRecognition.');
+    throw new Error('Este navegador nao suporta SpeechRecognition.');
   }
 
-  _recognition = _createRecognition();
+  running = true;
+  restartAttempts = 0;
+  resetTranscriptText();
+  recognition = createRecognition();
 
   try {
-    _recognition.start();
-    _scheduleChunkCut();
+    recognition.start();
+    scheduleChunkCut();
   } catch (e) {
-    _running = false;
-    _recognition = null;
-    _clearChunkTimer();
+    running = false;
+    recognition = null;
+    clearChunkTimer();
     throw e;
   }
 }
 
 export async function stopASRWS() {
-  if (!_running) return;
-  _running = false;
-
-  _clearChunkTimer();
-  _clearRestartPauseTimer();
-
-  try { _recognition?.stop(); } catch {}
-  _recognition = null;
+  if (!running) return;
+  running = false;
+  interimText = '';
+  clearChunkTimer();
+  clearRestartTimer();
+  try {
+    interimHandler('');
+    recognition?.stop();
+  } catch {}
+  recognition = null;
 }

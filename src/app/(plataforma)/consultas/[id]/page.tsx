@@ -156,7 +156,7 @@ export default function ConsultationDetailPage() {
   }, []);
 
   const handleTranscriptUpdate = useCallback((newItem: TranscriptItem) => {
-    setTranscript((prev) => [...prev, newItem]);
+    setTranscript(newItem.text ? [newItem] : []);
   }, []);
 
   const handleExamDataChange = useCallback((data: ExamFindings) => {
@@ -186,7 +186,7 @@ export default function ConsultationDetailPage() {
 
   const handleGenerateDocument = useCallback(async (docType: keyof DocumentsState) => {
     // Pega direto do adapter
-    const fullTranscriptTextAdapter = getTranscriptText();
+    const fullTranscriptTextAdapter = getTranscriptText().trim();
 
     if (!fullTranscriptTextAdapter && Object.keys(physicalExamData).length === 0) {
       toast.error('A transcrição e o exame físico estão vazios.');
@@ -195,11 +195,12 @@ export default function ConsultationDetailPage() {
 
     setIsGenerating(docType);
     const { fullTranscriptText, examText, vitalsText, patientHistoryText, labResultsText } = baseGenerationData;
+    const transcriptForAi = fullTranscriptTextAdapter || fullTranscriptText;
 
     try {
 
       // 🔍 DEBUG FRONT — antes de enviar pra API
-      const rawTranscript = getTranscriptText();
+      const rawTranscript = transcriptForAi;
 
       console.log('🎙️ FRONT → API', {
         length: rawTranscript?.length ?? 0,
@@ -213,7 +214,7 @@ export default function ConsultationDetailPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           consultationId: id,
-          transcript: fullTranscriptText,
+          transcript: transcriptForAi,
           patientName: patient?.full_name || 'Paciente',
           physicalExam: examText,
           vitals: vitalsText,

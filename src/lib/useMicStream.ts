@@ -49,6 +49,10 @@ export function useMicStream(isActive: boolean): UseMicStreamState {
       setError(null);
 
       try {
+        if (!navigator?.mediaDevices?.getUserMedia) {
+          throw new Error('Este navegador nao permite acesso nativo ao microfone.');
+        }
+
         const constraints: MediaStreamConstraints = {
           audio: {
             echoCancellation: true,

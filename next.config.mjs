@@ -1,6 +1,4 @@
 // next.config.mjs
-import webpack from 'webpack';
-
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
@@ -10,7 +8,7 @@ const nextConfig = {
     ],
   },
 
-  webpack: (config, { isServer }) => {
+  webpack: (config, { isServer, webpack }) => {
     // ❗ CONFIGURAÇÕES SÓ PARA O LADO DO SERVIDOR (isServer = true)
     if (isServer) {
       
